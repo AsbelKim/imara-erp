@@ -25,5 +25,12 @@ class DatabaseSeeder extends Seeder
             ]
         );
         $admin->assignRole($superAdmin);
+
+        // Seed statutory rates, earnings types, and deduction types
+        $this->call([
+            StatutoryRateSeeder::class,
+            EarningsTypeSeeder::class,
+            DeductionTypeSeeder::class,
+        ]);
     }
 }
