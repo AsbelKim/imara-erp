@@ -6,135 +6,194 @@ use App\Models\Employee;
 use App\Models\PayrollRun;
 use App\Models\Payslip;
 use Illuminate\Support\Facades\DB;
+use Carbon\Carbon;
 
+/**
+ * PayrollService orchestrates payroll processing with support for:
+ * - Flexible earnings and deductions
+ * - Configurable statutory rates
+ * - Audit logging
+ * - GL entry generation
+ * - Loan repayment integration
+ */
 class PayrollService
 {
+    private PayrollCalculationService $calculationService;
+    private PayrollGLService $glService;
+    private LoanService $loanService;
+
+    public function __construct(
+        PayrollCalculationService $calculationService,
+        PayrollGLService $glService,
+        LoanService $loanService
+    ) {
+        $this->calculationService = $calculationService;
+        $this->glService = $glService;
+        $this->loanService = $loanService;
+    }
+
+    /**
+     * Process a complete payroll run
+     */
     public function processRun(PayrollRun $run): void
     {
+        // Check for duplicate runs
+        $existingRun = PayrollRun::where('month', $run->month)
+            ->where('year', $run->year)
+            ->where('id', '!=', $run->id)
+            ->where('status', '!=', 'voided')
+            ->first();
+
+        if ($existingRun) {
+            throw new \Exception("Payroll already processed for {$run->month}/{$run->year}");
+        }
+
         $employees = Employee::where('status', 'active')->get();
 
         DB::transaction(function () use ($run, $employees) {
             $totalGross = $totalDeductions = $totalNet = 0;
+            $totalNSSFEmployer = 0;
+
+            $processDate = Carbon::createFromDate($run->year, $run->month, 1);
 
             foreach ($employees as $employee) {
-                $slip = $this->computePayslip($employee);
+                $slip = $this->calculatePayslip($employee, $processDate);
+
+                // Add payroll_run_id and employee_id
+                $slip['payroll_run_id'] = $run->id;
+                $slip['employee_id'] = $employee->id;
 
                 Payslip::updateOrCreate(
                     ['payroll_run_id' => $run->id, 'employee_id' => $employee->id],
                     $slip
                 );
 
-                $totalGross      += $slip['gross_salary'];
-                $totalDeductions += $slip['total_deductions'];
-                $totalNet        += $slip['net_salary'];
+                $totalGross           += $slip['gross_salary'];
+                $totalDeductions      += $slip['total_deductions'];
+                $totalNet             += $slip['net_salary'];
+                $totalNSSFEmployer    += $slip['nssf_employer'];
             }
 
+            // Update payroll run totals
             $run->update([
                 'total_gross'      => $totalGross,
                 'total_deductions' => $totalDeductions,
                 'total_net'        => $totalNet,
+                'total_nssf_employer' => $totalNSSFEmployer,
                 'status'           => 'processed',
                 'processed_by'     => auth()->id(),
                 'processed_at'     => now(),
             ]);
+
+            // Generate GL entries
+            $this->glService->generateGLEntriesForRun($run);
+
+            // Log the action
+            AuditLogService::logAction(
+                'processed',
+                $run,
+                "Payroll run processed for {$run->month}/{$run->year}",
+                ['employee_count' => $employees->count()]
+            );
         });
     }
 
-    public function computePayslip(Employee $employee): array
+    /**
+     * Calculate complete payslip for an employee
+     */
+    public function calculatePayslip(Employee $employee, ?Carbon $date = null): array
     {
-        $gross = (float) $employee->basic_salary;
+        $date = $date ?? now();
 
-        // NSSF 2024 — Tier I: 6% up to KES 7,000 (max 420); Tier II: 6% on 7,001-36,000
-        $nssfEmployee = $this->calculateNSSF($gross);
-        $nssfEmployer = $nssfEmployee;
+        return $this->calculationService->calculatePayslip($employee, $date);
+    }
 
-        // Taxable income = gross - NSSF employee
-        $taxable = max(0, $gross - $nssfEmployee);
+    /**
+     * Void a payroll run
+     */
+    public function voidRun(PayrollRun $run, ?string $reason = null): void
+    {
+        DB::transaction(function () use ($run, $reason) {
+            $run->update([
+                'status' => 'voided',
+                'voided_by' => auth()->id(),
+                'voided_at' => now(),
+            ]);
 
-        // PAYE (personal relief KES 2,400/month)
-        $paye = max(0, $this->calculatePAYE($taxable) - 2400);
+            // Reverse GL entries if posted
+            $this->glService->reverseGLEntries($run);
 
-        // NHIF (graduated)
-        $nhif = $this->calculateNHIF($gross);
+            // Log the action
+            AuditLogService::logAction(
+                'voided',
+                $run,
+                "Payroll run voided: {$reason}",
+                ['reason' => $reason]
+            );
+        });
+    }
 
-        // Housing Levy: 1.5% of gross
-        $housingLevy = round($gross * 0.015, 2);
+    /**
+     * Regenerate payslip for single employee
+     */
+    public function regeneratePayslip(PayrollRun $run, Employee $employee): Payslip
+    {
+        $slip = $this->calculatePayslip($employee, Carbon::createFromDate($run->year, $run->month, 1));
 
-        $totalDeductions = $nssfEmployee + $paye + $nhif + $housingLevy;
-        $net = max(0, $gross - $totalDeductions);
+        $payslip = Payslip::updateOrCreate(
+            ['payroll_run_id' => $run->id, 'employee_id' => $employee->id],
+            $slip
+        );
+
+        // Log the action
+        AuditLogService::logAction(
+            'regenerated',
+            $payslip,
+            "Payslip regenerated for {$employee->full_name}"
+        );
+
+        return $payslip;
+    }
+
+    /**
+     * Get payroll summary for a period
+     */
+    public function getPayrollSummary(int $month, int $year): array
+    {
+        $run = PayrollRun::where('month', $month)
+            ->where('year', $year)
+            ->first();
+
+        if (!$run) {
+            return [];
+        }
+
+        $payslips = $run->payslips()->get();
 
         return [
-            'basic_salary'     => $gross,
-            'gross_salary'     => $gross,
-            'nssf_employee'    => $nssfEmployee,
-            'nssf_employer'    => $nssfEmployer,
-            'nhif'             => $nhif,
-            'taxable_income'   => $taxable,
-            'paye'             => $paye,
-            'housing_levy'     => $housingLevy,
-            'total_deductions' => $totalDeductions,
-            'net_salary'       => $net,
+            'payroll_run_id'          => $run->id,
+            'period'                  => "{$month}/{$year}",
+            'employee_count'          => $payslips->count(),
+            'total_gross'             => $payslips->sum('gross_salary'),
+            'total_nssf_employee'     => $payslips->sum('nssf_employee'),
+            'total_nssf_employer'     => $payslips->sum('nssf_employer'),
+            'total_paye'              => $payslips->sum('paye'),
+            'total_shif'              => $payslips->sum('shif'),
+            'total_housing_levy'      => $payslips->sum('housing_levy'),
+            'total_statutory'         => $payslips->sum('total_statutory_deductions'),
+            'total_voluntary'         => $payslips->sum('total_voluntary_deductions'),
+            'total_deductions'        => $payslips->sum('total_deductions'),
+            'total_net'               => $payslips->sum('net_salary'),
+            'status'                  => $run->status,
+            'processed_at'            => $run->processed_at,
         ];
     }
 
-    private function calculateNSSF(float $gross): float
+    /**
+     * Get GL trial balance for payroll
+     */
+    public function getGLTrialBalance(PayrollRun $run): array
     {
-        $tierI  = min($gross, 7000) * 0.06;
-        $tierII = max(0, min($gross, 36000) - 7000) * 0.06;
-        return round($tierI + $tierII, 2);
-    }
-
-    private function calculatePAYE(float $taxable): float
-    {
-        $tax = 0;
-        $bands = [
-            [24000,  0.10],
-            [8333,   0.25],
-            [467667, 0.30],
-            [300000, 0.325],
-        ];
-
-        foreach ($bands as [$limit, $rate]) {
-            if ($taxable <= 0) break;
-            $chunk = min($taxable, $limit);
-            $tax   += $chunk * $rate;
-            $taxable -= $chunk;
-        }
-
-        // Above 800,000
-        if ($taxable > 0) {
-            $tax += $taxable * 0.35;
-        }
-
-        return round($tax, 2);
-    }
-
-    private function calculateNHIF(float $gross): float
-    {
-        $bands = [
-            [5999,   150],
-            [7999,   300],
-            [11999,  400],
-            [14999,  500],
-            [19999,  600],
-            [24999,  750],
-            [29999,  850],
-            [34999,  900],
-            [39999,  950],
-            [44999,  1000],
-            [49999,  1100],
-            [59999,  1200],
-            [69999,  1300],
-            [79999,  1400],
-            [89999,  1500],
-            [99999,  1600],
-            [PHP_INT_MAX, 1700],
-        ];
-
-        foreach ($bands as [$ceiling, $amount]) {
-            if ($gross <= $ceiling) return $amount;
-        }
-
-        return 1700;
+        return $this->glService->getTrialBalance($run);
     }
 }

@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Payslip extends Model
 {
@@ -36,5 +37,15 @@ class Payslip extends Model
     public function employee(): BelongsTo
     {
         return $this->belongsTo(Employee::class);
+    }
+
+    public function glEntries(): HasMany
+    {
+        return $this->hasMany(PayrollGLEntry::class);
+    }
+
+    public function loanRepayments(): HasMany
+    {
+        return $this->hasMany(LoanRepayment::class);
     }
 }

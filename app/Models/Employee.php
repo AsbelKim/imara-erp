@@ -50,4 +50,24 @@ class Employee extends Model
     {
         return $this->hasMany(Payslip::class);
     }
+
+    public function employeeEarnings(): HasMany
+    {
+        return $this->hasMany(EmployeeEarning::class);
+    }
+
+    public function employeeDeductions(): HasMany
+    {
+        return $this->hasMany(EmployeeDeduction::class);
+    }
+
+    public function attendanceRecords(): HasMany
+    {
+        return $this->hasMany(AttendanceRecord::class);
+    }
+
+    public function loans(): HasMany
+    {
+        return $this->hasMany(Loan::class);
+    }
 }
