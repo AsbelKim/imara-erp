@@ -38,4 +38,28 @@ class AuditLog extends Model
             'user_agent' => request()->userAgent(),
         ]);
     }
+
+    /**
+     * Scope: filter by user
+     */
+    public function scopeByUser($query, int $userId)
+    {
+        return $query->where('user_id', $userId);
+    }
+
+    /**
+     * Scope: filter by model type and id
+     */
+    public function scopeForModel($query, string $modelType, int $modelId)
+    {
+        return $query->where('model_type', $modelType)->where('model_id', $modelId);
+    }
+
+    /**
+     * Scope: get recent logs
+     */
+    public function scopeRecent($query, int $limit = 50)
+    {
+        return $query->orderByDesc('created_at')->limit($limit);
+    }
 }
